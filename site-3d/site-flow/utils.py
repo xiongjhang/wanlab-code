@@ -1,75 +1,182 @@
-import importlib
-import logging
 import os
-import shutil
 import sys
+import pickle
+from pathlib import Path
+from typing import Sequence, Iterable, List, Optional, Type, Union, Tuple
+from functools import partial
+import logging
+import importlib
+import shutil
 
 import h5py
 import numpy as np
-import torch
+import tifffile as tiff
+import SimpleITK as sitk
+import skimage
 from skimage.color import label2rgb
-from torch import optim
+import scipy
+import torch
+import torch.optim as optim
 
 
-def save_checkpoint(state, is_best, checkpoint_dir):
-    """Saves model and training parameters at '{checkpoint_dir}/last_checkpoint.pytorch'.
-    If is_best==True saves '{checkpoint_dir}/best_checkpoint.pytorch' as well.
+__class = ['global variable', 'util func', 'format conversion', 'nomalization', 
+        'logger', 'tensorboard',
+        'module', 'trainer', 'evaluation']
+
+# ===============
+# Global Variable
+# ===============
+
+_EPSILON = 1e-10
+PathType = Union[str, Path, Iterable[str], Iterable[Path]]
+
+# =========
+# Util Func
+# =========
+
+def get_class(class_name, modules):
+    for module in modules:
+        m = importlib.import_module(module)
+        clazz = getattr(m, class_name, None)
+        if clazz is not None:
+            return clazz
+    raise RuntimeError(f'Unsupported dataset class: {class_name}')
+
+# ============
+# Nomalization
+# ============
+
+def image_process(image: np.ndarray, mode: str) -> np.ndarray:
+    
+    if mode == 'simple_norm':
+        image = image / 255
+
+    elif mode == 'maxmin_norm':
+        image -= np.min(image)
+        image /= np.max(image)
+    
+    elif mode == 'stand':
+        image = (image-image.mean()) / image.std()
+        
+    return image.astype(np.float32)
+
+# =================
+# Format Conversion
+# =================
+
+def nrrd_to_tif(nrrd_path: PathType, tif_path: PathType):
+    """Turn `.nrrd` to `.tif`
 
     Args:
-        state (dict): contains model's state_dict, optimizer's state_dict, epoch
-            and best evaluation metric value so far
-        is_best (bool): if True state contains the best model seen so far
-        checkpoint_dir (string): directory where the checkpoint are to be saved
+        nrrd_path (PathType): _description_
+        tif_path (PathType): _description_
     """
 
-    if not os.path.exists(checkpoint_dir):
-        os.mkdir(checkpoint_dir)
+    nrrd_image = sitk.ReadImage(nrrd_path)
+    sitk.WriteImage(nrrd_image, tif_path)
 
-    last_file_path = os.path.join(checkpoint_dir, 'last_checkpoint.pytorch')
-    torch.save(state, last_file_path)
-    if is_best:
-        best_file_path = os.path.join(checkpoint_dir, 'best_checkpoint.pytorch')
-        shutil.copyfile(last_file_path, best_file_path)
-
-
-def load_checkpoint(checkpoint_path, model, optimizer=None,
-                    model_key='model_state_dict', optimizer_key='optimizer_state_dict'):
-    """Loads model and training parameters from a given checkpoint_path
-    If optimizer is provided, loads optimizer's state_dict of as well.
+    def tif_to_nrrd(tif_path: PathType, nrrd_path: PathType):
+        """Turn `.tif` to `.nrrd`
 
     Args:
-        checkpoint_path (string): path to the checkpoint to be loaded
-        model (torch.nn.Module): model into which the parameters are to be copied
-        optimizer (torch.optim.Optimizer) optional: optimizer instance into
-            which the parameters are to be copied
+        tif_path (PathType): _description_
+        nrrd_path (PathType): _description_
+    """
+
+    tif_image = sitk.ReadImage(tif_path)
+    sitk.WriteImage(tif_image, nrrd_path)
+
+def read_nrrd(nrrd_path: PathType):
+    image = sitk.ReadImage(nrrd_path)
+    image = sitk.GetArrayFromImage(image)
+    return image
+
+# ===============
+# Data Conversion
+# ===============
+
+def mask_to_coordinate(
+    matrix: np.ndarray, probability: float = 0.5
+) -> np.ndarray:
+    """Convert the prediction matrix into a list of coordinates.
+
+    NOTE - plt.scatter uses the x, y system. Therefore any plots
+    must be inverted by assigning x=c, y=r!
+
+    Args:
+        matrix: Matrix representation of spot coordinates.
+        image_size: Default image size the grid was layed on.
+        probability: Cutoff value to round model prediction probability.
 
     Returns:
-        state
+        Array of r, c coordinates with the shape (n, 2).
     """
-    if not os.path.exists(checkpoint_path):
-        raise IOError(f"Checkpoint '{checkpoint_path}' does not exist")
+    if not matrix.ndim == 2:
+        raise ValueError("Matrix must have a shape of (r, c).")
+    if not matrix.shape[0] == matrix.shape[1] and not matrix.shape[0] >= 1:
+        raise ValueError("Matrix must have equal length >= 1 of r, c.")
+    assert np.max(matrix) <= 1 and np.max(matrix) >= 0, 'Matrix must be prediction probability'
 
-    state = torch.load(checkpoint_path, map_location='cpu')
-    model.load_state_dict(state[model_key])
+    # Turn prob matrix into binary matrix (0-1)
+    binary_matrix = (matrix > probability).astype(int)
 
-    if optimizer is not None:
-        optimizer.load_state_dict(state[optimizer_key])
+    # Label connected regions
+    labeled_array = skimage.measure.label(binary_matrix)
 
-    return state
+    # Compute the centorid coordinates of each conneted regions
+    properties = skimage.measure.regionprops(labeled_array)
+    centers = [prop.centroid for prop in properties]
+    coords = np.array(centers)
 
+    return coords
 
-def save_network_output(output_path, output, logger=None):
-    if logger is not None:
-        logger.info(f'Saving network output to: {output_path}...')
-    output = output.detach().cpu()[0]
-    with h5py.File(output_path, 'w') as f:
-        f.create_dataset('predictions', data=output, compression='gzip')
+def coordinate_to_mask(
+    coords: np.ndarray, image_size: int = 128, n: int = 1, sigma: float = None, size_c: int = None
+) -> np.ndarray:
+    """Return np.ndarray of shape (n, n): r, c format.
 
+    Args:
+        coords: List of coordinates in r, c format with shape (n, 2).
+        image_size: Size of the image from which List of coordinates are extracted.
+        n: Size of the neighborhood to set to 1 or apply Gaussian filter.
+        sigma: Standard deviation for Gaussian kernel. If None, no Gaussian filter is applied.
+        size_c: If empty, assumes a squared image. Else the length of the r axis.
+
+    Returns:
+        The prediction matrix as numpy array of shape (n, n): r, c format.
+    """
+    nrow = ncol = image_size
+    if size_c is not None:
+        ncol = size_c
+
+    prediction_matrix = np.zeros((nrow, ncol))
+
+    for r, c in coords:
+        # Consider bonuder
+        r_min = max(0, r - n)
+        r_max = min(nrow, r + n + 1)
+        c_min = max(0, c - n)
+        c_max = min(ncol, c + n + 1)
+
+        # Assign values along pre人iction matrix 
+        if sigma is None:
+            prediction_matrix[r_min:r_max, c_min:c_max] = 255
+        else:
+            y, x = np.ogrid[-n:n+1, -n:n+1]
+            gaussian_kernel = np.exp(-(x**2 + y**2) / (2 * sigma**2))
+            gaussian_kernel /= gaussian_kernel.sum()  
+            prediction_matrix[r_min:r_max, c_min:c_max] += gaussian_kernel[:r_max-r_min, :c_max-c_min]
+
+    return prediction_matrix
+
+# =====
+# Loger
+# =====
 
 loggers = {}
 
-
 def get_logger(name, level=logging.INFO):
+
     global loggers
     if loggers.get(name) is not None:
         return loggers[name]
@@ -87,29 +194,9 @@ def get_logger(name, level=logging.INFO):
 
         return logger
 
-
-def get_number_of_learnable_parameters(model):
-    return sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-
-class RunningAverage:
-    """Computes and stores the average
-    """
-
-    def __init__(self):
-        self.count = 0
-        self.sum = 0
-        self.avg = 0
-
-    def update(self, value, n=1):
-        self.count += n
-        self.sum += value * n
-        self.avg = self.sum / self.count
-
-
-def number_of_features_per_level(init_channel_number, num_levels):
-    return [init_channel_number * 2 ** k for k in range(num_levels)]
-
+# ===========
+# Tensorboard
+# ===========
 
 class TensorboardFormatter:
     """
@@ -245,6 +332,87 @@ def get_tensorboard_formatter(formatter_config):
         return TensorboardFormatter()
     return TensorboardFormatter(**formatter_config)
 
+# ======
+# Module
+# ======
+
+def get_number_of_learnable_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def number_of_features_per_level(init_channel_number, num_levels):
+    return [init_channel_number * 2 ** k for k in range(num_levels)]
+
+def save_checkpoint(state, is_best, checkpoint_dir):
+    """Saves model and training parameters at '{checkpoint_dir}/last_checkpoint.pytorch'.
+    If is_best==True saves '{checkpoint_dir}/best_checkpoint.pytorch' as well.
+
+    Args:
+        state (dict): contains model's state_dict, optimizer's state_dict, epoch
+            and best evaluation metric value so far
+        is_best (bool): if True state contains the best model seen so far
+        checkpoint_dir (string): directory where the checkpoint are to be saved
+    """
+
+    if not os.path.exists(checkpoint_dir):
+        os.mkdir(checkpoint_dir)
+
+    last_file_path = os.path.join(checkpoint_dir, 'last_checkpoint.pytorch')
+    torch.save(state, last_file_path)
+    if is_best:
+        best_file_path = os.path.join(checkpoint_dir, 'best_checkpoint.pytorch')
+        shutil.copyfile(last_file_path, best_file_path)
+
+
+def load_checkpoint(checkpoint_path, model, optimizer=None,
+                    model_key='model_state_dict', optimizer_key='optimizer_state_dict'):
+    """Loads model and training parameters from a given checkpoint_path
+    If optimizer is provided, loads optimizer's state_dict of as well.
+
+    Args:
+        checkpoint_path (string): path to the checkpoint to be loaded
+        model (torch.nn.Module): model into which the parameters are to be copied
+        optimizer (torch.optim.Optimizer) optional: optimizer instance into
+            which the parameters are to be copied
+
+    Returns:
+        state
+    """
+    if not os.path.exists(checkpoint_path):
+        raise IOError(f"Checkpoint '{checkpoint_path}' does not exist")
+
+    state = torch.load(checkpoint_path, map_location='cpu')
+    model.load_state_dict(state[model_key])
+
+    if optimizer is not None:
+        optimizer.load_state_dict(state[optimizer_key])
+
+    return state
+
+
+def save_network_output(output_path, output, logger=None):
+    if logger is not None:
+        logger.info(f'Saving network output to: {output_path}...')
+    output = output.detach().cpu()[0]
+    with h5py.File(output_path, 'w') as f:
+        f.create_dataset('predictions', data=output, compression='gzip')
+
+# =======
+# Trainer
+# =======
+
+class RunningAverage:
+    """Computes and stores the average
+    """
+
+    def __init__(self):
+        self.count = 0
+        self.sum = 0
+        self.avg = 0
+
+    def update(self, value, n=1):
+        self.count += n
+        self.sum += value * n
+        self.avg = self.sum / self.count
 
 def expand_as_one_hot(input, C, ignore_index=None):
     """
@@ -279,7 +447,6 @@ def expand_as_one_hot(input, C, ignore_index=None):
     else:
         # scatter to get the one-hot tensor
         return torch.zeros(shape).to(input.device).scatter_(1, input, 1)
-
 
 def convert_to_numpy(*inputs):
     """
@@ -372,7 +539,6 @@ def create_optimizer(optimizer_config, model):
 
     return optimizer
 
-
 def create_lr_scheduler(lr_config, optimizer):
     if lr_config is None:
         return None
@@ -384,10 +550,68 @@ def create_lr_scheduler(lr_config, optimizer):
     return clazz(**lr_config)
 
 
-def get_class(class_name, modules):
-    for module in modules:
-        m = importlib.import_module(module)
-        clazz = getattr(m, class_name, None)
-        if clazz is not None:
-            return clazz
-    raise RuntimeError(f'Unsupported dataset class: {class_name}')
+# =========
+# Evaluation
+# =========
+
+def euclidean_dist(x1: float, y1: float, x2: float, y2: float) -> float:
+    """Return the euclidean distance between two the points (x1, y1) and (x2, y2)."""
+    return np.sqrt(np.square(x1 - x2) + np.square(y1 - y2))
+
+def offset_euclidean(offset: List[tuple]) -> np.ndarray:
+    """Calculates the euclidean distance based on row_column_offsets per coordinate."""
+    return np.sqrt(np.sum(np.square(np.array(offset)), axis=-1))
+
+def _get_offsets(
+    pred: np.ndarray, true: np.ndarray, rows: np.ndarray, cols: np.ndarray
+) -> List[tuple]:
+    """Return a list of (r, c) offsets for all assigned coordinates.
+
+    Args:
+        pred: List of all predicted coordinates.
+        true: List of all ground truth coordinates.
+        rows: Rows of the assigned coordinates (along "true"-axis).
+        cols: Columns of the assigned coordinates (along "pred"-axis).
+    """
+    return [
+        (true[r][0] - pred[c][0], true[r][1] - pred[c][1]) for r, c in zip(rows, cols)
+    ]
+
+def linear_sum_assignment(
+    matrix: np.ndarray, cutoff: float = None
+) -> Tuple[list, list]:
+    """Solve the linear sum assignment problem with a cutoff.
+
+    A problem instance is described by matrix matrix where each matrix[i, j]
+    is the cost of matching i (worker) with j (job). The goal is to find the
+    most optimal assignment of j to i if the given cost is below the cutoff.
+
+    Args:
+        matrix: Matrix containing cost/distance to assign cols to rows.
+        cutoff: Maximum cost/distance value assignments can have.
+
+    Returns:
+        (rows, columns) corresponding to the matching assignment.
+    """
+    # Handle zero-sized matrices (occurs if true or pred has no items)
+    if matrix.size == 0:
+        return [], []
+
+    # Prevent scipy to optimize on values above the cutoff
+    if cutoff is not None and cutoff != 0:
+        matrix = np.where(matrix >= cutoff, matrix.max(), matrix)
+
+    row, col = scipy.optimize.linear_sum_assignment(matrix)
+
+    if cutoff is None:
+        return list(row), list(col)
+
+    # As scipy will still assign all columns to rows
+    # We here remove assigned values falling below the cutoff
+    nrow = []
+    ncol = []
+    for r, c in zip(row, col):
+        if matrix[r, c] <= cutoff:
+            nrow.append(r)
+            ncol.append(c)
+    return nrow, ncol

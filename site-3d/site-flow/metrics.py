@@ -8,8 +8,7 @@ import numpy as np
 import pandas as pd
 import scipy.optimize
 
-from utils.util import _EPSILON, offset_euclidean, _get_offsets, linear_sum_assignment
-
+from .utils import _EPSILON, offset_euclidean, _get_offsets, linear_sum_assignment
 
 
 class F1Score:
