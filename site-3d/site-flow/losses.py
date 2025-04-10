@@ -169,48 +169,12 @@ class BCEDiceLoss(nn.Module):
 # Entry Funciton
 # ==============
 
-def get_loss_criterion(config):
-    """
-    Returns the loss function based on provided configuration
-    :param config: (dict) a top level configuration object containing the 'loss' key
-    :return: an instance of the loss function
-    """
-    assert 'loss' in config, 'Could not find loss function configuration'
-    loss_config = config['loss']
-    name = loss_config.pop('name')
-
-    ignore_index = loss_config.pop('ignore_index', None)
-    skip_last_target = loss_config.pop('skip_last_target', False)
-    weight = loss_config.pop('weight', None)
-
-    if weight is not None:
-        weight = torch.tensor(weight)
-
-    pos_weight = loss_config.pop('pos_weight', None)
-    if pos_weight is not None:
-        pos_weight = torch.tensor(pos_weight)
-
-    loss = _create_loss(name, loss_config, weight, ignore_index, pos_weight)
-
-    if not (ignore_index is None or name in ['CrossEntropyLoss', 'WeightedCrossEntropyLoss']):
-        # use MaskingLossWrapper only for non-cross-entropy losses, since CE losses allow specifying 'ignore_index' directly
-        loss = _MaskingLossWrapper(loss, ignore_index)
-
-    if skip_last_target:
-        loss = SkipLastTargetChannelWrapper(loss, loss_config.get('squeeze_channel', False))
-
-    if torch.cuda.is_available():
-        loss = loss.cuda()
-
-    return loss
-
 def _create_loss(name, loss_config, weight, ignore_index, pos_weight):
     if name == 'BCEWithLogitsLoss':
         return nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     elif name == 'BCEDiceLoss':
         alpha = loss_config.get('alpha', 1.)
-        beta = loss_config.get('beta', 1.)
-        return BCEDiceLoss(alpha, beta)
+        return BCEDiceLoss(alpha)
     elif name == 'CrossEntropyLoss':
         if ignore_index is None:
             ignore_index = -100  # use the default 'ignore_index' as defined in the CrossEntropyLoss
@@ -219,8 +183,6 @@ def _create_loss(name, loss_config, weight, ignore_index, pos_weight):
         if ignore_index is None:
             ignore_index = -100  # use the default 'ignore_index' as defined in the CrossEntropyLoss
         return WeightedCrossEntropyLoss(ignore_index=ignore_index)
-    elif name == 'PixelWiseCrossEntropyLoss':
-        return PixelWiseCrossEntropyLoss(ignore_index=ignore_index)
     elif name == 'GeneralizedDiceLoss':
         normalization = loss_config.get('normalization', 'sigmoid')
         return GeneralizedDiceLoss(normalization=normalization)
@@ -239,3 +201,41 @@ def _create_loss(name, loss_config, weight, ignore_index, pos_weight):
                                     apply_below_threshold=loss_config.get('apply_below_threshold', True))
     else:
         raise RuntimeError(f"Unsupported loss function: '{name}'")
+
+def get_loss_criterion(config):
+    """
+    Returns the loss function based on provided configuration
+    :param config: (dict) a top level configuration object containing the 'loss' key
+    :return: an instance of the loss function
+    """
+    assert 'loss' in config, 'Could not find loss function configuration'
+    loss_config = config['loss']
+    name = loss_config.pop('name')
+    logger.info(f"Creating loss function: {name}")
+
+    ignore_index = loss_config.pop('ignore_index', None)
+    skip_last_target = loss_config.pop('skip_last_target', False)
+    weight = loss_config.pop('weight', None)
+
+    if weight is not None:
+        weight = torch.tensor(weight).float()
+        logger.info(f"Using class weights: {weight}")
+
+    pos_weight = loss_config.pop('pos_weight', None)
+    if pos_weight is not None:
+        pos_weight = torch.tensor(pos_weight)
+
+    loss = _create_loss(name, loss_config, weight, ignore_index, pos_weight)
+
+    if not (ignore_index is None or name in ['CrossEntropyLoss', 'WeightedCrossEntropyLoss']):
+        # use MaskingLossWrapper only for non-cross-entropy losses, since CE losses allow specifying 'ignore_index' directly
+        loss = MaskingLossWrapper(loss, ignore_index)
+
+    if skip_last_target:
+        loss = SkipLastTargetChannelWrapper(loss, loss_config.get('squeeze_channel', False))
+
+    if torch.cuda.is_available():
+        loss = loss.cuda()
+
+    return loss
+
